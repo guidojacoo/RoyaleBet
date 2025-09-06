@@ -1,410 +1,417 @@
-import express from "express"
-import axios from "axios"
-import FormData from "form-data"
-import M from "./messages.js"
-import {
-  upsertUsuario, setUser, getByPhone, getById, addSaldo,
-  crearPartida, getPartida, setRival, setEstado, setGanador, setGroupMsg,
-  listarPartidasAbiertas,
-  crearCarga, setCargaMedia, setCargaEstado, getCarga, getCargaPendienteUsuario,
-  crearRetiro, setRetiroEstado, getRetiro
-} from "./db.js"
-import { buscarMatchReciente } from "./clash.js"
+// royalebet v2 - evolution api (grupos), verificacion clash, pagos manuales
+import 'dotenv/config'
+import express from 'express'
+import axios from 'axios'
+import { Pool } from 'pg'
 
-let app = express()
-app.use(express.json())
+const app = express()
+app.use(express.json({ limit: '5mb' }))
+app.use(express.urlencoded({ extended: true }))
 
-const WURL = "https://graph.facebook.com/v20.0/" + process.env.WABA_PHONE_ID + "/messages"
-const WH = { headers: { Authorization: "Bearer " + process.env.WABA_TOKEN } }
-const GRAPH = "https://graph.facebook.com/v20.0"
+// env
+const EVO_BASE = process.env.EVOLUTION_URL || 'http://127.0.0.1:8080'
+const EVO_KEY  = process.env.EVOLUTION_API_KEY
+const INSTANCE = process.env.EVOLUTION_INSTANCE || 'royalebet'
+const GROUP_ID = process.env.GROUP_ID || ''                           // 1203...@g.us
+const ADMIN_JIDS = (process.env.ADMIN_JIDS || '').split(',').map(s=>s.trim()).filter(Boolean)
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || ''                 // https://.../evo-webhook
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'whsec'
+const PORT = process.env.PORT || 3000
 
-const PRECIO = parseFloat(process.env.PRICE_PER_FICHA || "1")
-const FEE   = parseFloat(process.env.FEE_PORCENTAJE || "0.10")
-const ADMINS = (process.env.ADMIN_PHONES||"").split(",").map(s=>s.trim()).filter(Boolean)
-const ADMINS_CONTACTO = process.env.ADMINS_CONTACTO || "admin 1, admin 2"
-const PAGO_ALIAS = process.env.PAGO_ALIAS_O_CVU || "tu.alias"
+const CR_API   = process.env.CLASH_API || 'https://api.clashroyale.com/v1'
+const CR_TOKEN = process.env.CLASH_TOKEN
+const CR_HEADERS = { Authorization: `Bearer ${CR_TOKEN}` }
 
-function sendText(to, body){
-  return axios.post(WURL, { messaging_product:"whatsapp", to, text:{ body } }, WH)
-}
-function replyText(to, replyToMessageId, body){
-  return axios.post(WURL, {
-    messaging_product:"whatsapp", to,
-    context:{ message_id: replyToMessageId },
-    text:{ body }
-  }, WH)
-}
-async function postToGroupAndReturnId(body){
-  const r = await axios.post(WURL, { messaging_product:"whatsapp", to: process.env.GRUPO_ID, text:{ body } }, WH)
-  try { return r.data.messages[0].id } catch { return null }
-}
-async function sendImageById(to, mediaId, caption){
-  return axios.post(WURL, { messaging_product:"whatsapp", to, image: { id: mediaId, caption } }, WH)
-}
-async function downloadMedia(mediaId){
-  // paso 1: obtener url
-  const a = await axios.get(`${GRAPH}/${mediaId}`, WH)
-  const url = a.data.url
-  // paso 2: descargar binario
-  const b = await axios.get(url, { headers: { Authorization: "Bearer "+process.env.WABA_TOKEN }, responseType: "arraybuffer" })
-  return { buffer: Buffer.from(b.data), mime: b.headers["content-type"] || "image/jpeg" }
-}
-async function uploadMedia(buffer, mime){
-  const fd = new FormData()
-  fd.append("messaging_product","whatsapp")
-  fd.append("file", buffer, { filename: "comp.jpg", contentType: mime })
-  fd.append("type", mime)
-  const r = await axios.post(`${GRAPH}/${process.env.WABA_PHONE_ID}/media`, fd, { headers: { Authorization: "Bearer "+process.env.WABA_TOKEN, ...fd.getHeaders() } })
-  return r.data.id
-}
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+const q = async (sql, p=[]) => (await pool.query(sql, p)).rows
 
-// parser
-function parseCmd(msg){
-  const t=(msg||"").trim()
-  const l=t.toLowerCase()
-  if(l==="menu") return {cmd:"menu"}
-  if(l==="1") return {cmd:"reg_ask_user"}
-  if(l==="2") return {cmd:"reglas"}
-  if(l==="3") return {cmd:"cargar_info"}
-  if(l.startsWith("cargar ")) return {cmd:"cargar_monto", raw:t}
-  if(l==="4") return {cmd:"crear_ask"}
-  if(l.startsWith("crear ")) return {cmd:"crear", raw:t}
-  if(l==="5") return {cmd:"unirme_ask"}
-  if(l.startsWith("unirme")) return {cmd:"unirme", raw:t}
-  if(l==="6") return {cmd:"resultado_hint"}
-  if(l.startsWith("resultado")) return {cmd:"resultado", raw:t}
-  if(l==="7") return {cmd:"retirar_info"}
-  if(l.startsWith("retirar ")) return {cmd:"retirar", raw:t}
-  if(l==="8") return {cmd:"soporte"}
-  if(l==="panel") return {cmd:"admin_panel"}
-  if(l.startsWith("admin ")) return {cmd:"admin_cmd", raw:t}
-  if(l.startsWith("cancelar")) return {cmd:"cancelar", raw:t}
-  return {cmd:"other", raw:t}
+// ensure schema (por si falta correr sql_init.sql)
+await pool.query(`
+CREATE TABLE IF NOT EXISTS usuarios(
+  jid text PRIMARY KEY, username text, clash_tag text, saldo int DEFAULT 0, created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS mesas(
+  id bigserial PRIMARY KEY, creador text NOT NULL, oponente text,
+  fichas int NOT NULL, estado text NOT NULL DEFAULT 'abierta',
+  premio int NOT NULL, rake int NOT NULL DEFAULT 10,
+  creador_tag text, oponente_tag text,
+  started_at timestamptz, ended_at timestamptz,
+  ganador text, duracion_seg int, created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS depositos(
+  id bigserial PRIMARY KEY, jid text NOT NULL, monto int NOT NULL, estado text NOT NULL DEFAULT 'pendiente', media_url text, created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS retiros(
+  id bigserial PRIMARY KEY, jid text NOT NULL, monto int NOT NULL, cvu text NOT NULL, estado text NOT NULL DEFAULT 'pendiente', created_at timestamptz DEFAULT now()
+);
+`)
+
+// helpers
+const normTag = t => { if(!t) return null; let s=t.trim().toUpperCase(); if(s.startsWith('#')) s=s.slice(1); return '#'+s }
+const encTag  = t => '%23'+normTag(t).slice(1)
+const isAdmin = jid => ADMIN_JIDS.includes(jid)
+const mention = jid => `@${(jid.split('@')[0]||'')}`
+
+async function sendTextJid(jid, text){
+  // evolution sendText (v2): POST /message/sendText/{instance} con body {number,text} y header apikey
+  // doc: https://doc.evolution-api.com/v2/api-reference/message-controller/send-text
+  await axios.post(
+    `${EVO_BASE}/message/sendText/${INSTANCE}`,
+    { number: jid, text },
+    { headers: { 'Content-Type':'application/json', apikey: EVO_KEY }, timeout: 10000 }
+  )
 }
 
-/* webhook verify */
-app.get("/webhook",(req,res)=>{
-  if(req.query["hub.verify_token"]===process.env.WABA_VERIFY_TOKEN) res.send(req.query["hub.challenge"])
-  else res.sendStatus(403)
+async function sendGroup(text){
+  if (!GROUP_ID) return
+  return sendTextJid(GROUP_ID, text)
+}
+
+async function battlelog(tag){
+  const { data } = await axios.get(`${CR_API}/players/${encTag(tag)}/battlelog`, { headers: CR_HEADERS, timeout: 10000 })
+  return Array.isArray(data) ? data : []
+}
+const parseBattleTime = s => { const d=new Date(s); return isNaN(d.getTime())?new Date():d }
+const extract = b => ({
+  teamTag: b.team?.[0]?.tag ? '#'+String(b.team[0].tag).toUpperCase() : null,
+  oppTag:  b.opponent?.[0]?.tag ? '#'+String(b.opponent[0].tag).toUpperCase() : null,
+  teamCrowns: b.team?.[0]?.crowns ?? null,
+  oppCrowns:  b.opponent?.[0]?.crowns ?? null
+})
+async function findMatchBetween(tagA, tagB, startedAt){
+  const A=normTag(tagA), B=normTag(tagB)
+  const tol=2*60*1000, since=new Date((startedAt?new Date(startedAt).getTime():Date.now())-tol)
+  const cand=[...(await battlelog(A)), ...(await battlelog(B))]
+  for(const b of cand){
+    const t=parseBattleTime(b.battleTime); if (t<since) continue
+    const {teamTag,oppTag,teamCrowns,oppCrowns}=extract(b)
+    if (!teamTag||!oppTag) continue
+    const set=new Set([teamTag,oppTag]); if (!set.has(A)||!set.has(B)) continue
+    let winner=null
+    if (teamTag===A) { if (teamCrowns>oppCrowns) winner=A; else if (oppCrowns>teamCrowns) winner=B }
+    else if (oppTag===A) { if (oppCrowns>teamCrowns) winner=A; else if (teamCrowns>oppCrowns) winner=B }
+    return { when:t, winnerTag:winner }
+  }
+  return null
+}
+
+function menu(u){
+  return `bienvenido ${u?.username||u?.jid||''}
+
+1) menu
+2) cargar fichas
+3) crear sala
+4) unirme a sala
+5) mi saldo
+6) configurar usuario/tag
+7) retirar
+
+comandos:
+usuario <nombre>
+tag <#ABC123>
+mesa <fichas>
+unirme <id>
+cancelar <id>
+verificar <id>
+saldo
+retirar <monto> <cvu>`
+}
+
+function bienvenida(){
+  return `hola! te explico rapido:
+
+- para jugar 1v1 necesito tu usuario y tu tag de clash royale.
+- como sacar tu tag:
+  1) abre clash royale
+  2) toca tu perfil
+  3) copia el tag que empieza con # (ej: #ABC123)
+
+registrate enviando:
+usuario <tu_nombre>
+tag <#TU_TAG>
+
+cuando termines, manda "menu".`
+}
+
+// evo webhook (entrantes). formato general v2, ver docs de webhooks.
+// vamos a tolerar estructuras distintas y extraer: remoteJid, fromMe, text/imagem, etc.
+app.post('/evo-webhook', async (req, res) => {
+  try{
+    // seguridad simple
+    if (WEBHOOK_SECRET && req.headers['x-webhook-secret'] !== WEBHOOK_SECRET) {
+      return res.sendStatus(401)
+    }
+
+    const payload = req.body || {}
+    // evolution puede mandar uno o varios eventos. normalizamos como array
+    const events = Array.isArray(payload) ? payload : (payload.events || [payload])
+    for (const ev of events) {
+      const msg = ev?.message || ev?.data || ev // segun version
+      const remoteJid = msg?.key?.remoteJid || msg?.remoteJid || ev?.remoteJid
+      const fromMe = msg?.key?.fromMe || msg?.fromMe || false
+
+      // ignorar mensajes del propio bot
+      if (!remoteJid || fromMe) continue
+
+      // solo procesamos DM (jid persona termina con @s.whatsapp.net)
+      const isGroup = remoteJid.endsWith('@g.us')
+      if (isGroup) continue
+
+      const text =
+        msg?.message?.conversation ||
+        msg?.message?.extendedTextMessage?.text ||
+        ev?.text ||
+        ''
+
+      const mediaUrl =
+        msg?.message?.imageMessage?.url ||
+        msg?.message?.documentMessage?.url ||
+        null
+
+      await routeUser(remoteJid, text.trim().toLowerCase(), mediaUrl)
+    }
+    res.sendStatus(200)
+  }catch(e){
+    console.log('webhook err', e.message)
+    res.sendStatus(200)
+  }
 })
 
-/* webhook receive */
-app.post("/webhook", async (req,res)=>{
-  res.sendStatus(200)
-  const e=req.body.entry && req.body.entry[0]
-  if(!e) return
-  const c=e.changes && e.changes[0]
-  if(!c || !c.value || !c.value.messages) return
-  const m=c.value.messages[0]
-  const from=m.from
-  if(!from) return
+async function upsertUser(jid){
+  const u = (await q('select * from usuarios where jid=$1',[jid]))[0]
+  if (u) return u
+  return (await q('insert into usuarios(jid) values($1) returning *',[jid]))[0]
+}
 
-  const u=await upsertUsuario(from)
+async function getUser(jid){ return (await q('select * from usuarios where jid=$1',[jid]))[0] }
 
-  // tipos
-  const isText = !!(m.text && m.text.body)
-  const isImage= m.type==="image" && m.image && m.image.id
+async function routeUser(jid, body, mediaUrl){
+  const user = await upsertUser(jid)
 
-  // si es imagen: se trata como comprobante si hay carga pendiente
-  if(isImage){
+  // imagen = comprobante
+  if (mediaUrl){
+    const dep = (await q('select * from depositos where jid=$1 and estado=$2 order by id desc limit 1',[jid,'pendiente']))[0]
+    if (!dep){ await sendTextJid(jid, 'no tenes depositos pendientes. primero: "cargar <monto>"'); return }
+    await q('update depositos set media_url=$1 where id=$2',[mediaUrl, dep.id])
+    await sendTextJid(jid, `recibi el comprobante del deposito #${dep.id}. un admin lo revisa y acredita.`)
+    for (const a of ADMIN_JIDS) await sendTextJid(a, `comprobante deposito #${dep.id}\nuser: ${jid}\nmonto: ${dep.monto}\n${mediaUrl}`)
+    return
+  }
+
+  if (!body || body==='hola'){
+    await sendTextJid(jid, bienvenida())
+    await sendTextJid(jid, menu(user))
+    return
+  }
+
+  if (isAdmin(jid)){ await handleAdmin(jid, body); return }
+
+  if (['1','menu','m'].includes(body)) return sendTextJid(jid, menu(user))
+
+  if (body.startsWith('usuario ')){
+    const name = body.slice(8).trim().slice(0,20)
+    await q('update usuarios set username=$1 where jid=$2',[name, jid])
+    const u = await getUser(jid)
+    await sendTextJid(jid, `listo ${u.username||''}.`)
+    return sendTextJid(jid, menu(u))
+  }
+
+  if (body.startsWith('tag ')){
+    const tag = normTag(body.slice(4))
+    if (!tag || !/^#[A-Z0-9]+$/.test(tag)) return sendTextJid(jid, 'tag invalido. ej: tag #ABC123')
+    await q('update usuarios set clash_tag=$1 where jid=$2',[tag, jid])
+    const u = await getUser(jid)
+    await sendTextJid(jid, `guardado tu tag ${u.clash_tag}.`)
+    return sendTextJid(jid, menu(u))
+  }
+
+  if (['2','cargar','cargar fichas'].includes(body) || body.startsWith('cargar ')){
+    const parts = body.split(/\s+/)
+    const monto = parseInt(parts[1]||'0',10)
+    if (!monto){
+      return sendTextJid(jid,
+        `para cargar:\n- transfiere al alias/cvu indicado\n- envia una **imagen** del comprobante aca\n- un admin acredita\n\nsi queres abrir ticket: "cargar 500"`)
+    }
+    const dep = (await q('insert into depositos(jid,monto) values($1,$2) returning id',[jid,monto]))[0]
+    await sendTextJid(jid, `ticket #${dep.id} por ${monto} creado. envia ahora la **imagen** del comprobante.`)
+    for (const a of ADMIN_JIDS) await sendTextJid(a, `nuevo deposito #${dep.id}\nuser: ${jid}\nmonto: ${monto}\nestado: pendiente`)
+    return
+  }
+
+  if (['7','retirar'].includes(body) || body.startsWith('retirar ')){
+    const parts = body.split(/\s+/)
+    const monto = parseInt(parts[1]||'0',10)
+    const cvu   = parts.slice(2).join(' ').trim()
+    if (!monto || !cvu) return sendTextJid(jid, 'formato: retirar <monto> <cvu/alias>')
+    const u = await getUser(jid)
+    if (u.saldo < monto) return sendTextJid(jid, `no te alcanza. saldo: ${u.saldo}`)
+    const r = (await q('insert into retiros(jid,monto,cvu) values($1,$2,$3) returning id',[jid,monto,cvu]))[0]
+    for (const a of ADMIN_JIDS) await sendTextJid(a, `retiro #${r.id}\nuser: ${jid}\nmonto: ${monto}\ncvu: ${cvu}\nestado: pendiente`)
+    return sendTextJid(jid, `retiro #${r.id} enviado a admins. te avisamos cuando se pague.`)
+  }
+
+  if (['3','crear','crear sala'].includes(body) || body.startsWith('mesa ') || body.startsWith('crear ')){
+    const parts = body.split(/\s+/)
+    const fichas = parseInt(parts[1]||'0',10)
+    if (!fichas || fichas<=0) return sendTextJid(jid, 'formato: mesa <fichas>')
+    const u = await getUser(jid)
+    if (!u.clash_tag) return sendTextJid(jid, 'primero guarda tu tag: tag #ABC123')
+    if (u.saldo < fichas) return sendTextJid(jid, `no te alcanza. saldo: ${u.saldo}`)
+    const rake=10, premio=(fichas*2) - Math.floor((fichas*2)*rake/100)
+    const r = (await q('insert into mesas(creador,fichas,premio,rake,creador_tag) values($1,$2,$3,$4,$5) returning id',[jid,fichas,premio,rake,u.clash_tag]))[0]
+    await q('update usuarios set saldo = saldo - $1 where jid=$2',[fichas, jid])
+    await sendTextJid(jid, `creaste la mesa #${r.id} (${fichas} fichas). para unirse: "unirme ${r.id}"`)
+    if (GROUP_ID){
+      await sendGroup(`[mesa #${r.id}] ${fichas} vs ${fichas}
+premio neto: ${premio} (rake ${rake}%)
+creador: ${mention(jid)}
+para unirse: "unirme ${r.id}"`)
+    } else {
+      for (const a of ADMIN_JIDS) await sendTextJid(a, `[reenviar al grupo]\nmesa #${r.id} por ${fichas} fichas\npremio ${premio}\ncreador ${jid}`)
+    }
+    return
+  }
+
+  if (['4','unirme'].includes(body) || body.startsWith('unirme ')){
+    const id = parseInt(body.split(/\s+/)[1]||'0',10)
+    if (!id) return sendTextJid(jid, 'formato: unirme <id>')
+    const mesa = (await q('select * from mesas where id=$1',[id]))[0]
+    if (!mesa) return sendTextJid(jid, `no existe la mesa #${id}`)
+    if (mesa.estado!=='abierta') return sendTextJid(jid, `la mesa #${id} no esta abierta`)
+    if (mesa.creador===jid) return sendTextJid(jid, 'no podes unirte a tu propia mesa')
+    const u = await getUser(jid)
+    if (!u.clash_tag) return sendTextJid(jid, 'primero guarda tu tag: tag #ABC123')
+    if (u.saldo < mesa.fichas) return sendTextJid(jid, `no te alcanza. saldo: ${u.saldo}`)
+
+    await q('update usuarios set saldo = saldo - $1 where jid=$2',[mesa.fichas, jid])
+    await q('update mesas set oponente=$1, oponente_tag=$2, estado=$3, started_at=now() where id=$4',[jid,u.clash_tag,'en_juego',id])
+
+    await sendTextJid(mesa.creador, `match listo en mesa #${id}!\noponente: ${jid}\ncuando terminen: verificar ${id}`)
+    await sendTextJid(jid, `entraste a mesa #${id}. creador: ${mesa.creador}\ncuando terminen: verificar ${id}`)
+    if (GROUP_ID) await sendGroup(`mesa #${id} ahora en juego. suerte!`)
+    return
+  }
+
+  if (body.startsWith('cancelar ')){
+    const id = parseInt(body.split(/\s+/)[1]||'0',10)
+    if (!id) return sendTextJid(jid, 'formato: cancelar <id>')
+    const mesa = (await q('select * from mesas where id=$1',[id]))[0]
+    if (!mesa) return sendTextJid(jid, `no existe la mesa #${id}`)
+    if (mesa.creador!==jid) return sendTextJid(jid, 'solo el creador puede cancelar')
+    if (mesa.estado!=='abierta') return sendTextJid(jid, 'la mesa ya no se puede cancelar')
+    await q('update mesas set estado=$1 where id=$2',['cancelada',id])
+    await q('update usuarios set saldo = saldo + $1 where jid=$2',[mesa.fichas, jid])
+    await sendTextJid(jid, `mesa #${id} cancelada. devolvimos ${mesa.fichas} fichas.`)
+    if (GROUP_ID) await sendGroup(`mesa #${id} cancelada por el creador.`)
+    return
+  }
+
+  if (body.startsWith('verificar ')){
+    const id = parseInt(body.split(/\s+/)[1]||'0',10)
+    if (!id) return sendTextJid(jid, 'formato: verificar <id>')
+    const mesa = (await q('select * from mesas where id=$1',[id]))[0]
+    if (!mesa) return sendTextJid(jid, `no existe la mesa #${id}`)
+    if (mesa.estado!=='en_juego') return sendTextJid(jid, `la mesa #${id} no esta en juego`)
+    if (!mesa.creador_tag || !mesa.oponente_tag) return sendTextJid(jid, 'faltan tags, configuren con: tag #ABC123')
+
     try{
-      const cargaPend = await getCargaPendienteUsuario(u.id)
-      if(!cargaPend){
-        await sendText(from, "recibi la imagen. si es un comprobante, primero usa: cargar {monto}")
+      const match = await findMatchBetween(mesa.creador_tag, mesa.oponente_tag, mesa.started_at)
+      if (!match) { await sendTextJid(jid, 'no encontre la partida en battlelog aun. intenten de nuevo en 1-2 minutos.'); return }
+      if (!match.winnerTag){
+        for (const a of ADMIN_JIDS) await sendTextJid(a, `empate detectado mesa #${id}. decidir manual con: aprobarwin ${id} <jid>`)
+        await sendTextJid(jid, 'aparecio como empate. un admin decidira el ganador.')
         return
       }
-      // bajar y re-subir media para poder reenviar
-      const {buffer,mime} = await downloadMedia(m.image.id)
-      const newId = await uploadMedia(buffer, mime)
+      let ganador=null
+      if (normTag(mesa.creador_tag)===match.winnerTag) ganador=mesa.creador
+      if (normTag(mesa.oponente_tag)===match.winnerTag) ganador=mesa.oponente
+      if (!ganador){ for (const a of ADMIN_JIDS) await sendTextJid(a, `no pude mapear ganador en mesa #${id}. usar: aprobarwin ${id} <jid>`); await sendTextJid(jid,'hubo un problema mapeando el ganador. admin decidira.'); return }
 
-      // guardar media ids
-      await setCargaMedia(cargaPend.id, m.image.id, newId)
+      await q('update mesas set estado=$1, ganador=$2, ended_at=now() where id=$3',['finalizada',ganador,id])
+      await q('update usuarios set saldo = saldo + $1 where jid=$2',[mesa.premio, ganador])
 
-      // avisar a usuario
-      await sendText(from, M.pago_recibido_user.replace("{id}", cargaPend.id))
-
-      // armar caption para admins
-      const uu = await getById(u.id)
-      const caption = M.pago_admin_caption
-        .replaceAll("{id}", cargaPend.id)
-        .replace("{user}", uu.username||"user")
-        .replace("{phone}", uu.phone)
-        .replace("{monto}", cargaPend.monto_pesos)
-        .replace("{ref}", cargaPend.referencia)
-
-      // enviar a admins (grupo si hay, si no a cada admin)
-      if(process.env.GRUPO_ID){
-        await sendImageById(process.env.GRUPO_ID, newId, caption)
-      }else{
-        for(const a of ADMINS){ await sendImageById(a, newId, caption) }
-      }
-    }catch(err){
-      console.error("error reenviando comprobante", err)
-      await sendText(from, "hubo un problema con tu comprobante, probemos de nuevo en 1 minuto")
-    }
-    return
-  }
-
-  // texto
-  const text = (m.text && m.text.body)||""
-  const {cmd, raw} = parseCmd(text)
-
-  // helpers
-  const sendMenu = async (uid)=>{
-    const user = await getById(uid)
-    await sendText(user.phone, M.menu_header(user) + "\n\n" + M.menu_ops)
-  }
-
-  if(cmd==="menu"){ await sendMenu(u.id); return }
-  if(cmd==="reglas"){ await sendText(from, M.reglas); return }
-  if(cmd==="soporte"){ await sendText(from, M.soporte); return }
-
-  // registro
-  if(cmd==="reg_ask_user"){ await sendText(from, M.pedir_username); return }
-  if(!u.username && cmd==="other" && text && !text.includes(" ") && text.length>=3){
-    await setUser(u.id, text.trim(), u.tag_cr||"")
-    await sendText(from, M.pedir_tag); return
-  }
-  if(text.startsWith("#") && (!u.tag_cr || u.tag_cr==="")){
-    const uu=await setUser(u.id, u.username||"user", text.trim())
-    await sendText(from, M.registrado_ok.replace("{username}", uu.username).replace("{tag}", "#"+uu.tag_cr))
-    await sendMenu(u.id); return
-  }
-
-  // cargar manual (pedido + datos de pago + genera id)
-  if(cmd==="cargar_info"){ await sendText(from, M.cargar_info); return }
-  if(cmd==="cargar_monto"){
-    const monto = parseInt(raw.split(" ")[1]||"0",10)
-    if(!(monto>0)){ await sendText(from,"formato: cargar 1500"); return }
-    const ref = "DEP-" + Math.floor(1000 + Math.random()*9000)
-    const cg = await crearCarga(u.id, monto, ref)
-    await sendText(from, M.pago_datos
-      .replaceAll("{id}", cg.id)
-      .replace("{monto}", monto)
-      .replace("{alias}", PAGO_ALIAS)
-      .replace("{ref}", ref)
-    )
-    return
-  }
-
-  // retiro: retirar {monto} cvu:XXXX
-  if(cmd==="retirar_info"){ await sendText(from, M.retirar_info); return }
-  if(cmd==="retirar"){
-    const parts = raw.split(" ")
-    const monto = parseInt(parts[1]||"0",10)
-    const cvu  = (parts.find(x=>x.toLowerCase().startsWith("cvu:"))||"").split(":")[1]||""
-    if(!(monto>0) || !cvu){ await sendText(from, 'formato: retirar 2000 cvu:mi.alias'); return }
-    const me=await getById(u.id)
-    if(me.saldo_fichas < monto){ await sendText(from, M.saldo_insuf); return }
-    // bloquear fichas
-    await addSaldo(u.id, -monto, "retiro_bloq", null)
-    const r = await crearRetiro(u.id, monto, cvu)
-    await sendText(from, M.retiro_pend_user.replace("{id}", r.id).replace("{monto}", monto).replace("{cvu}", cvu))
-    const uu = await getById(u.id)
-    const msg = M.retiro_admin_msg
-      .replaceAll("{id}", r.id)
-      .replace("{user}", uu.username||"user")
-      .replace("{phone}", uu.phone)
-      .replace("{monto}", monto)
-      .replace("{cvu}", cvu)
-    if(process.env.GRUPO_ID){ await sendText(process.env.GRUPO_ID, msg) }
-    else { for(const a of ADMINS){ await sendText(a, msg) } }
-    return
-  }
-
-  // crear / cancelar / unirse / resultado (igual que antes)
-  if(cmd==="crear_ask"){ await sendText(from, M.pedir_fichas_crear); return }
-  if(cmd==="crear"){
-    const fichas=parseInt(raw.split(" ")[1]||"0",10)
-    if(!(fichas>0)){ await sendText(from,"formato: crear 10"); return }
-    const me=await getById(u.id)
-    if(me.saldo_fichas < fichas){ await sendText(from, M.saldo_insuf); return }
-    await addSaldo(u.id, -fichas, "bloqueo", null)
-    const p=await crearPartida(u.id, fichas, FEE)
-    const body=M.partida_publicada
-      .replace("{id}", p.id).replace("{f}", p.fichas)
-      .replace("{pozo}", p.pozo_fichas)
-      .replace("{premio}", p.premio_fichas)
-      .replace("{user}", u.username||u.phone)
-    const msgId=await postToGroupAndReturnId(body)
-    if(msgId) await setGroupMsg(p.id, msgId)
-    await sendText(from, M.partida_creada_ok.replace("{id}", p.id))
-    return
-  }
-  if(cmd==="cancelar"){
-    const id=parseInt(raw.split(" ").pop().replace("id:",""),10)
-    if(!(id>0)){ await sendText(from,"formato: cancelar id:123"); return }
-    const p=await getPartida(id)
-    if(!p || p.estado!=="buscando_rival"){ await sendText(from, M.partida_no_disponible); return }
-    if(p.creador!==u.id){ await sendText(from,"solo el creador puede cancelar"); return }
-    await addSaldo(u.id, p.fichas, "devolucion", id)
-    await setEstado(id,"cancelada")
-    await sendText(from, M.partida_cancelada_priv.replace("{id}", id))
-    if(p.group_msg_id){ await replyText(process.env.GRUPO_ID, p.group_msg_id, M.partida_cancelada_grupo.replace("{id}", id)) }
-    return
-  }
-  if(cmd==="unirme_ask"){ await sendText(from, M.pedir_id_unirme); return }
-  if(cmd==="unirme"){
-    const id=parseInt(raw.split(" ").pop().replace("id:",""),10)
-    if(!(id>0)){ await sendText(from,"formato: unirme id:123"); return }
-    const p=await getPartida(id)
-    if(!p || p.estado!=="buscando_rival"){ await sendText(from, M.partida_no_disponible); return }
-    const me=await getById(u.id)
-    if(me.saldo_fichas < p.fichas){ await sendText(from, M.saldo_insuf); return }
-    await addSaldo(u.id, -p.fichas, "bloqueo", id)
-    const px=await setRival(id, u.id)
-    const creador=await getById(px.creador)
-    await sendText(from, M.emparejado_rival.replace("{id}", id).replace("{tel_creador}", creador.phone))
-    await sendText(creador.phone, M.emparejado_creador.replace("{id}", id).replace("{tel_rival}", u.phone))
-    return
-  }
-  if(cmd==="resultado_hint"){
-    await sendText(from, M.resultado_hint.replace("{id}","123").replace("{user}","tu_usuario"))
-    return
-  }
-  if(cmd==="resultado"){
-    const parts=raw.split(" ")
-    const id=parseInt((parts[1]||"").replace("id:",""),10)
-    if(!(id>0)){ await sendText(from,"formato: resultado id:123 ganador:@usuario"); return }
-    const p=await getPartida(id)
-    if(!p || p.estado!=="en_juego"){ await sendText(from,"la partida no esta en juego"); return }
-
-    await setEstado(id,"pendiente_api")
-    await sendText(from, M.resultado_recibido.replace("{id}", id))
-
-    const creador=await getById(p.creador)
-    const rival  =await getById(p.rival)
-    const tagC = "#"+(creador.tag_cr||"")
-    const tagR = "#"+(rival.tag_cr||"")
-
-    const v=await buscarMatchReciente(tagC, tagR, 15)
-    if(v.ok){
-      const ganadorId = (v.ganador.toUpperCase() === tagC.toUpperCase()) ? p.creador : p.rival
-      const perdedorId= (ganadorId===p.creador)? p.rival : p.creador
-      await setGanador(id, ganadorId)
-      await setEstado(id,"liquidada")
-
-      const saldoG = await addSaldo(ganadorId, p.premio_fichas, "premio", id)
-      const ganadorUserName = (ganadorId===p.creador? creador.username : rival.username) || "ganador"
-
-      const p2=await getPartida(id)
-      const ms= Math.max(0, new Date(p2.ended_at)-new Date(p2.started_at||p2.creado))
-      const mins = Math.floor(ms/60000)
-      const secs = Math.floor((ms%60000)/1000)
-
-      await sendText((await getById(ganadorId)).phone, M.liquidada_g.replace("{id}",id).replace("{user}",ganadorUserName).replace("{premio}",p.premio_fichas).replace("{saldo}",saldoG))
-      const perdPhone=(await getById(perdedorId)).phone
-      const saldoP=(await getById(perdedorId)).saldo_fichas
-      await sendText(perdPhone, M.liquidada_p.replace("{id}",id).replace("{saldo}",saldoP))
-
-      if(p.group_msg_id){
-        const txt=M.result_grupo
-          .replace("{id}", id).replace("{user}", ganadorUserName)
-          .replace("{mins}", mins).replace("{secs}", secs)
-          .replace("{premio}", p.premio_fichas)
-        await replyText(process.env.GRUPO_ID, p.group_msg_id, txt)
-      }
+      await sendTextJid(mesa.creador, `resultado mesa #${id}: ganador ${ganador}. premio ${mesa.premio}`)
+      if (mesa.oponente) await sendTextJid(mesa.oponente, `resultado mesa #${id}: ganador ${ganador}. premio ${mesa.premio}`)
+      if (GROUP_ID) await sendGroup(`resultado mesa #${id}: ganador ${mention(ganador)} | premio ${mesa.premio}`)
+      return
+    }catch(e){
+      for (const a of ADMIN_JIDS) await sendTextJid(a, `error battlelog mesa #${id}: ${e.message}. usar: aprobarwin ${id} <jid>`)
+      await sendTextJid(jid, 'error consultando battlelog. intenta luego o habla con admin.')
       return
     }
-    await sendText(from, M.pedir_video.replace("{oponente}", (creador.phone===from? rival.username : creador.username)||"oponente"))
-    return
   }
 
-  // admin panel texto
-  if(cmd==="admin_panel"){
-    if(!ADMINS.includes(from)){ await sendText(from, M.admin_err); return }
-    await sendText(from, M.admin_panel); return
+  if (['5','saldo'].includes(body)){
+    const u = await getUser(jid)
+    return sendTextJid(jid, `tu saldo: ${u.saldo} fichas`)
   }
 
-  // admin comandos
-  if(cmd==="admin_cmd"){
-    if(!ADMINS.includes(from)){ await sendText(from, M.admin_err); return }
-    const l=raw.toLowerCase()
+  return sendTextJid(jid, `no te entendi. escribe "menu".`)
+}
 
-    // admin cargar phone:xxx fichas:nn
-    if(l.startsWith("admin cargar")){
-      const parts=raw.split(" ")
-      const ph=(parts.find(x=>x.startsWith("phone:"))||"").split(":")[1]||""
-      const fs=parseInt((parts.find(x=>x.startsWith("fichas:"))||"").split(":")[1]||"0",10)
-      if(!ph || !(fs>0)){ await sendText(from,"formato: admin cargar phone:... fichas:..."); return }
-      const u2=await getByPhone(ph); if(!u2){ await sendText(from,"no existe ese phone"); return }
-      const s=await addSaldo(u2.id, fs, "carga", null)
-      await sendText(from, M.admin_ok+" saldo:"+s)
-      await sendText(u2.phone, `carga manual aprobada ✅ +${fs} fichas. saldo: ${s}`)
-      return
-    }
-
-    // admin descontar phone:xxx fichas:nn
-    if(l.startsWith("admin descontar")){
-      const parts=raw.split(" ")
-      const ph=(parts.find(x=>x.startsWith("phone:"))||"").split(":")[1]||""
-      const fs=parseInt((parts.find(x=>x.startsWith("fichas:"))||"").split(":")[1]||"0",10)
-      if(!ph || !(fs>0)){ await sendText(from,"formato: admin descontar phone:... fichas:..."); return }
-      const u2=await getByPhone(ph); if(!u2){ await sendText(from,"no existe ese phone"); return }
-      const s=await addSaldo(u2.id, -fs, "descuento", null)
-      await sendText(from, M.admin_ok+" saldo:"+s)
-      await sendText(u2.phone, `se descontaron ${fs} fichas. saldo: ${s}`)
-      return
-    }
-
-    // admin carga aprobar id:nn  |  admin carga rechazar id:nn
-    if(l.startsWith("admin carga aprobar")){
-      const id=parseInt(l.split("id:")[1]||"0",10)
-      if(!(id>0)){ await sendText(from,"formato: admin carga aprobar id:123"); return }
-      const cg=await getCarga(id); if(!cg || cg.estado!=='pendiente'){ await sendText(from,"carga inexistente o no pendiente"); return }
-      const fichas = cg.monto_pesos // 1 peso = 1 ficha
-      const saldo = await addSaldo(cg.usuario, fichas, "carga", null)
-      await setCargaEstado(id,"aprobada")
-      const usr=await getById(cg.usuario)
-      await sendText(from, M.admin_ok)
-      await sendText(usr.phone, M.carga_aprobada_user.replace("{id}", id).replace("{fichas}", fichas).replace("{saldo}", saldo))
-      await sendText(usr.phone, M.menu_header(usr) + "\n\n" + M.menu_ops)
-      return
-    }
-    if(l.startsWith("admin carga rechazar")){
-      const id=parseInt(l.split("id:")[1]||"0",10)
-      if(!(id>0)){ await sendText(from,"formato: admin carga rechazar id:123"); return }
-      const cg=await getCarga(id); if(!cg || cg.estado!=='pendiente'){ await sendText(from,"carga inexistente o no pendiente"); return }
-      await setCargaEstado(id,"rechazada")
-      const usr=await getById(cg.usuario)
-      await sendText(from, M.admin_ok)
-      await sendText(usr.phone, M.carga_rechazada_user.replace("{id}", id))
-      await sendText(usr.phone, M.menu_header(usr) + "\n\n" + M.menu_ops)
-      return
-    }
-
-    // admin retiro aprobar/rechazar
-    if(l.startsWith("admin retiro aprobar")){
-      const id=parseInt(l.split("id:")[1]||"0",10)
-      if(!(id>0)){ await sendText(from,"formato: admin retiro aprobar id:123"); return }
-      const r=await getRetiro(id); if(!r || r.estado!=='pendiente'){ await sendText(from,"retiro inexistente o no pendiente"); return }
-      await setRetiroEstado(id,"pagado")
-      const usr=await getById(r.usuario)
-      await sendText(from, M.admin_ok)
-      await sendText(usr.phone, M.retiro_pagado_user.replace("{id}", id))
-      await sendText(usr.phone, M.menu_header(usr) + "\n\n" + M.menu_ops)
-      return
-    }
-    if(l.startsWith("admin retiro rechazar")){
-      const id=parseInt(l.split("id:")[1]||"0",10)
-      if(!(id>0)){ await sendText(from,"formato: admin retiro rechazar id:123"); return }
-      const r=await getRetiro(id); if(!r || r.estado!=='pendiente'){ await sendText(from,"retiro inexistente o no pendiente"); return }
-      // devolver fichas
-      await addSaldo(r.usuario, r.monto_pesos, "retiro_dev", null)
-      await setRetiroEstado(id,"rechazado")
-      const usr=await getById(r.usuario)
-      await sendText(from, M.admin_ok)
-      await sendText(usr.phone, M.retiro_rechazado_user.replace("{id}", id))
-      await sendText(usr.phone, M.menu_header(usr) + "\n\n" + M.menu_ops)
-      return
-    }
-
-    await sendText(from, M.admin_panel); return
+async function handleAdmin(jid, body){
+  if (body==='panel'){
+    return sendTextJid(jid, `panel admin:
+cargar <jid> <monto> [id_dep]
+debitar <jid> <monto>
+aprobarwin <id_mesa> <jid_ganador>
+pagar <id_retiro>
+rechazar <id>`)
   }
 
-  // default
-  await sendText(from, M.menu_header(u) + "\n\n" + M.menu_ops)
-})
+  if (body.startsWith('cargar ')){
+    const p=body.split(/\s+/); const target=p[1]; const monto=parseInt(p[2]||'0',10); const depId=parseInt(p[3]||'0',10)
+    if (!target||!monto) return sendTextJid(jid,'uso: cargar <jid> <monto> [id_deposito]')
+    await q('update usuarios set saldo = saldo + $1 where jid=$2',[monto,target])
+    if (depId) await q('update depositos set estado=$1 where id=$2',['aprobado',depId])
+    await sendTextJid(target, `✅ acreditamos ${monto} fichas. escribe "menu" para ver opciones.`)
+    return sendTextJid(jid, `ok, ${monto} a ${target}${depId?` y deposito #${depId} aprobado`:''}`)
+  }
 
-app.get("/",(_req,res)=>res.send("ok"))
-app.listen(process.env.PORT||3000)
+  if (body.startsWith('debitar ')){
+    const p=body.split(/\s+/); const target=p[1]; const monto=parseInt(p[2]||'0',10)
+    if (!target||!monto) return sendTextJid(jid,'uso: debitar <jid> <monto>')
+    await q('update usuarios set saldo = greatest(0, saldo - $1) where jid=$2',[monto,target])
+    await sendTextJid(target, `⚠️ se debitaron ${monto} fichas por ajuste.`)
+    return sendTextJid(jid, `ok, debitadas ${monto} a ${target}`)
+  }
+
+  if (body.startsWith('aprobarwin ')){
+    const p=body.split(/\s+/); const id=parseInt(p[1]||'0',10); const ganador=p[2]
+    if (!id||!ganador) return sendTextJid(jid,'uso: aprobarwin <id_mesa> <jid_ganador>')
+    const mesa=(await q('select * from mesas where id=$1',[id]))[0]
+    if (!mesa) return sendTextJid(jid,`no existe mesa #${id}`)
+    if (mesa.estado==='finalizada') return sendTextJid(jid,`mesa #${id} ya finalizada`)
+    await q('update mesas set estado=$1, ganador=$2, ended_at=now() where id=$3',['finalizada',ganador,id])
+    await q('update usuarios set saldo = saldo + $1 where jid=$2',[mesa.premio,ganador])
+    await sendTextJid(mesa.creador, `resultado mesa #${id} (admin): ganador ${ganador}. premio ${mesa.premio}`)
+    if (mesa.oponente) await sendTextJid(mesa.oponente, `resultado mesa #${id} (admin): ganador ${ganador}. premio ${mesa.premio}`)
+    if (GROUP_ID) await sendGroup(`resultado mesa #${id} (admin): ganador ${mention(ganador)} | premio ${mesa.premio}`)
+    return sendTextJid(jid, 'ok, ganador seteado y premio acreditado.')
+  }
+
+  if (body.startsWith('pagar ')){
+    const id=parseInt(body.split(/\s+/)[1]||'0',10)
+    const r=(await q('select * from retiros where id=$1',[id]))[0]
+    if (!r) return sendTextJid(jid,`no existe retiro #${id}`)
+    if (r.estado!=='pendiente') return sendTextJid(jid,`retiro #${id} no esta pendiente`)
+    await q('update usuarios set saldo = saldo - $1 where jid=$2',[r.monto,r.jid])
+    await q('update retiros set estado=$1 where id=$2',['pagado',id])
+    await sendTextJid(r.jid, `✅ retiro #${id} pagado por ${r.monto}. gracias!`)
+    return sendTextJid(jid, `ok, retiro #${id} pagado`)
+  }
+
+  if (body.startsWith('rechazar ')){
+    const id=parseInt(body.split(/\s+/)[1]||'0',10)
+    const d=(await q('update depositos set estado=$1 where id=$2 and estado=$3 returning jid',['rechazado',id,'pendiente']))
+    if (d.length){ await sendTextJid(d[0].jid, `❌ tu deposito #${id} fue rechazado`); return sendTextJid(jid, `rechazado deposito #${id}`) }
+    const r=(await q('update retiros set estado=$1 where id=$2 and estado=$3 returning jid',['rechazado',id,'pendiente']))
+    if (r.length){ await sendTextJid(r[0].jid, `❌ tu retiro #${id} fue rechazado`); return sendTextJid(jid, `rechazado retiro #${id}`) }
+    return sendTextJid(jid, `no encontre pendiente #${id}`)
+  }
+
+  return sendTextJid(jid,'comando admin no reconocido. escribe "panel"')
+}
+
+app.get('/', (_req,res)=>res.send('ok'))
+app.listen(PORT, ()=>console.log('bot listo en puerto', PORT))

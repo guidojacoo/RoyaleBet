@@ -1,7 +1,16 @@
 services:
-  bot:
-    build: .
-    env_file: .env
+  evolution:
+    image: atendai/evolution-api:latest
+    container_name: evolution
     ports:
-      - "3000:3000"
+      - "8080:8080"
+    environment:
+      - SERVER_PORT=8080
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - DEL_INSTANCE=false
+      - QRCODE_LIMIT=300
+      - PROVIDER_ENABLED=true
+      - PROVIDER_HOST=0.0.0.0
+      - CONFIG_SESSION_PHONE_NAME=royalebet
+      - CONFIG_SESSION_GENERATE_PREVIEW_LINK=true
     restart: unless-stopped
